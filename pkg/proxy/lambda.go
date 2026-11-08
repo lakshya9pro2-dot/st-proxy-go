@@ -112,6 +112,10 @@ func RunLambdaRuntime(handler http.Handler) {
 			}
 		}
 
+		start := time.Now()
+		log.Printf("[lambda] received reqID=%s method=%s path=%s host=%s range=%s",
+			reqID, event.HTTPMethod, pathAndQuery, event.Headers["host"], event.Headers["range"])
+
 		// 3. Execute HTTP handler
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httpReq)
@@ -129,6 +133,9 @@ func RunLambdaRuntime(handler http.Handler) {
 		}
 
 		resBodyBytes := rec.Body.Bytes()
+		log.Printf("[lambda] completed reqID=%s status=%d body_bytes=%d duration=%v",
+			reqID, rec.Code, len(resBodyBytes), time.Since(start))
+
 		// Always base64 encode response for safe binary/video/chunk transport
 		lambdaResp.Body = base64.StdEncoding.EncodeToString(resBodyBytes)
 		lambdaResp.IsBase64Encoded = true

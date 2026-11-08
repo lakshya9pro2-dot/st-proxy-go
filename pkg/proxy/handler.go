@@ -5,11 +5,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// MaxServerlessChunkSize is the maximum video chunk size (2MB) proxied per request.
+// Prevents AWS Lambda / Netlify 30-second timeouts and 6MB payload limits on multi-gigabyte video files.
+const MaxServerlessChunkSize int64 = 2 * 1024 * 1024
 
 // ProxyHandler is the HTTP handler for the Netlify Go proxy.
 type ProxyHandler struct {
@@ -18,18 +25,41 @@ type ProxyHandler struct {
 	secret            string
 	allowedDomains    string
 	allowInsecureTest bool
+	cache             *MemoryCache
+	sf                *SingleflightGroup
+	bufferPool        sync.Pool
 }
 
 // NewProxyHandler creates a new ProxyHandler instance.
 func NewProxyHandler(secret, allowedDomains string, allowInsecureTest bool) *ProxyHandler {
+	transport := &http.Transport{
+		MaxIdleConns:          500,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
+		DisableCompression:    true, // Do not compress video streams - wastes CPU!
+	}
+
 	return &ProxyHandler{
 		sessions: NewSessionManager(secret, DefaultSessionTTL),
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Transport: transport,
+			Timeout:   30 * time.Second,
 		},
 		secret:            secret,
 		allowedDomains:    allowedDomains,
 		allowInsecureTest: allowInsecureTest,
+		cache:             NewMemoryCache(),
+		sf:                NewSingleflightGroup(),
+		bufferPool: sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, 128*1024)
+				return &b
+			},
+		},
 	}
 }
 
@@ -52,6 +82,12 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			path = "/"
 		}
 	}
+
+	clientIP := r.Header.Get("X-Forwarded-For")
+	if clientIP == "" {
+		clientIP = r.RemoteAddr
+	}
+	log.Printf("[req] %s %s client_ip=%s range=%s", r.Method, path, clientIP, r.Header.Get("Range"))
 
 	proxyBaseURL := h.deriveBaseURL(r)
 
@@ -266,15 +302,8 @@ func (h *ProxyHandler) handleExtractGet(w http.ResponseWriter, r *http.Request, 
 }
 
 func (h *ProxyHandler) executeExtraction(w http.ResponseWriter, ctx context.Context, provider, id, videoID, mediaType, proxyBaseURL string) {
-	var ext *ExtractResult
-	var err error
-
 	prov := strings.ToLower(strings.TrimSpace(provider))
-	if prov == "streamhg" || prov == "hanerix" || prov == "sh" {
-		ext, err = ExtractStreamHG(ctx, id)
-	} else if prov == "streamtape" || prov == "st" {
-		ext, err = ExtractStreamtape(ctx, id)
-	} else {
+	if prov != "streamhg" && prov != "hanerix" && prov != "sh" && prov != "streamtape" && prov != "st" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -284,14 +313,41 @@ func (h *ProxyHandler) executeExtraction(w http.ResponseWriter, ctx context.Cont
 		return
 	}
 
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":   "extraction_failed",
-			"message": err.Error(),
+	cleanID := strings.TrimSpace(id)
+	cacheKey := fmt.Sprintf("%s:%s", prov, cleanID)
+
+	var ext *ExtractResult
+	if cachedVal, ok := h.cache.Get(cacheKey); ok {
+		if res, castOk := cachedVal.(*ExtractResult); castOk && res != nil {
+			ext = res
+			log.Printf("[extract] in-memory cache hit for key=%s", cacheKey)
+		}
+	}
+
+	if ext == nil {
+		log.Printf("[extract] cache miss for key=%s, initiating extraction with singleflight", cacheKey)
+		resVal, err := h.sf.Do(cacheKey, func() (interface{}, error) {
+			if prov == "streamhg" || prov == "hanerix" || prov == "sh" {
+				return ExtractStreamHG(ctx, cleanID)
+			}
+			return ExtractStreamtape(ctx, cleanID)
 		})
-		return
+
+		if err != nil {
+			log.Printf("[extract] extraction failed for %s (%s): %v", prov, cleanID, err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error":   "extraction_failed",
+				"message": err.Error(),
+			})
+			return
+		}
+
+		ext = resVal.(*ExtractResult)
+		// Cache for 2 hours (upstream stream tokens valid for 4-12 hours)
+		h.cache.Set(cacheKey, ext, 2*time.Hour)
+		log.Printf("[extract] cached extraction for key=%s (ttl=2h)", cacheKey)
 	}
 
 	sessionID, expiresAt, err := h.sessions.CreateSession(ext.StreamURL, SanitizeUpstreamHeaders(ext.Headers), videoID, mediaType, prov)
@@ -308,6 +364,8 @@ func (h *ProxyHandler) executeExtraction(w http.ResponseWriter, ctx context.Cont
 	playbackURL := fmt.Sprintf("%s/session/%s/%s", strings.TrimRight(proxyBaseURL, "/"), sessionID, suffix)
 
 	w.Header().Set("Content-Type", "application/json")
+	// Cache-Control: tell Netlify Edge CDN and browsers to cache extract response
+	w.Header().Set("Cache-Control", "public, max-age=3600, s-maxage=7200, stale-while-revalidate=600")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":         true,
 		"provider":        prov,
@@ -360,14 +418,18 @@ func (h *ProxyHandler) handleFetchAndRewritePlaylist(w http.ResponseWriter, r *h
 	rewritten := RewritePlaylist(string(body), targetURL, sessionID, proxyBaseURL)
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Cache-Control", "public, max-age=10, must-revalidate")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(rewritten))
 }
 
 func (h *ProxyHandler) handleProxyResource(w http.ResponseWriter, r *http.Request, targetURL string, session *SessionData) {
+	start := time.Now()
+	clientRange := r.Header.Get("Range")
+
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, nil)
 	if err != nil {
+		log.Printf("[proxy] failed to create request for %s: %v", targetURL, err)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -379,17 +441,33 @@ func (h *ProxyHandler) handleProxyResource(w http.ResponseWriter, r *http.Reques
 		req.Header.Set("User-Agent", DefaultUserAgent)
 	}
 
-	// Forward client Range header
-	if rg := r.Header.Get("Range"); rg != "" {
-		req.Header.Set("Range", rg)
+	// For direct MP4/video streaming, apply safe chunk clamping to prevent Lambda 30s timeouts
+	isDirectVideo := strings.Contains(targetURL, ".mp4") || strings.Contains(targetURL, ".mkv") || strings.Contains(targetURL, "tapecontent.net")
+	appliedRange := clientRange
+	if isDirectVideo && r.Method != http.MethodHead {
+		clamped, modified := ClampRange(clientRange, MaxServerlessChunkSize)
+		appliedRange = clamped
+		if modified {
+			log.Printf("[proxy] clamped range for serverless payload: client=%q -> upstream=%q", clientRange, clamped)
+		}
 	}
+
+	if appliedRange != "" {
+		req.Header.Set("Range", appliedRange)
+	}
+
+	log.Printf("[proxy] fetching upstream target=%s method=%s range=%s", targetURL, r.Method, appliedRange)
 
 	resp, err := h.client.Do(req)
 	if err != nil {
+		log.Printf("[proxy] upstream request failed after %v: %v", time.Since(start), err)
 		http.Error(w, fmt.Sprintf("Failed to fetch upstream resource: %v", err), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+
+	log.Printf("[proxy] upstream responded in %v: status=%d content_length=%s content_range=%s content_type=%s",
+		time.Since(start), resp.StatusCode, resp.Header.Get("Content-Length"), resp.Header.Get("Content-Range"), resp.Header.Get("Content-Type"))
 
 	for _, k := range []string{"Content-Range", "Content-Length", "Content-Type", "Accept-Ranges", "Last-Modified", "ETag"} {
 		if v := resp.Header.Get(k); v != "" {
@@ -397,14 +475,81 @@ func (h *ProxyHandler) handleProxyResource(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
+	if isDirectVideo || strings.HasSuffix(r.URL.Path, ".ts") || strings.HasSuffix(r.URL.Path, ".m4s") {
+		w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
+	}
 
 	w.WriteHeader(resp.StatusCode)
 	if r.Method == http.MethodHead {
 		return
 	}
 
-	buf := make([]byte, 128*1024)
-	_, _ = io.CopyBuffer(w, resp.Body, buf)
+	// Limit reader to at most MaxServerlessChunkSize + 128KB to prevent memory exhaustion or hangs
+	var src io.Reader = resp.Body
+	if isDirectVideo {
+		src = io.LimitReader(resp.Body, MaxServerlessChunkSize+128*1024)
+	}
+
+	bufPtr := h.bufferPool.Get().(*[]byte)
+	defer h.bufferPool.Put(bufPtr)
+	buf := *bufPtr
+
+	n, copyErr := io.CopyBuffer(w, src, buf)
+	if copyErr != nil {
+		log.Printf("[proxy] copy buffer error after %d bytes: %v", n, copyErr)
+	} else {
+		log.Printf("[proxy] completed stream transfer: copied=%d bytes total_time=%v", n, time.Since(start))
+	}
+}
+
+// ClampRange calculates safe serverless range header to prevent 30-second timeouts on multi-gigabyte video files.
+func ClampRange(rawRange string, maxChunk int64) (string, bool) {
+	rawRange = strings.TrimSpace(rawRange)
+	if rawRange == "" {
+		// No range provided: request initial chunk 0-(maxChunk-1)
+		return fmt.Sprintf("bytes=0-%d", maxChunk-1), true
+	}
+
+	if !strings.HasPrefix(strings.ToLower(rawRange), "bytes=") {
+		return rawRange, false
+	}
+
+	spec := strings.TrimPrefix(rawRange, "bytes=")
+	parts := strings.Split(spec, "-")
+	if len(parts) != 2 {
+		return rawRange, false
+	}
+
+	startStr := strings.TrimSpace(parts[0])
+	endStr := strings.TrimSpace(parts[1])
+
+	if startStr == "" {
+		// Suffix range: bytes=-500 (last 500 bytes)
+		return rawRange, false
+	}
+
+	start, err := strconv.ParseInt(startStr, 10, 64)
+	if err != nil || start < 0 {
+		return rawRange, false
+	}
+
+	if endStr == "" {
+		// Open range: bytes=start- -> clamp to start + maxChunk - 1
+		end := start + maxChunk - 1
+		return fmt.Sprintf("bytes=%d-%d", start, end), true
+	}
+
+	end, err := strconv.ParseInt(endStr, 10, 64)
+	if err != nil || end < start {
+		return rawRange, false
+	}
+
+	if end-start+1 > maxChunk {
+		end = start + maxChunk - 1
+		return fmt.Sprintf("bytes=%d-%d", start, end), true
+	}
+
+	return rawRange, false
 }
 
 // EnvOrDefault gets environment variable or returns fallback.

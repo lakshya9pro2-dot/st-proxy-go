@@ -144,3 +144,45 @@ func TestProxy_LiveStreamtape_ExtractionAnd206(t *testing.T) {
 		t.Errorf("expected Content-Range starting with 'bytes 0-100/', got %s", cr)
 	}
 }
+
+func TestProxy_Extract_CacheAndSingleflight(t *testing.T) {
+	h := NewProxyHandler("", "", true)
+
+	// Seed cache directly to verify instant hit and Cache-Control
+	fakeExt := &ExtractResult{
+		StreamURL:  "https://test.tapecontent.net/video.mp4",
+		DirectURL:  "https://test.tapecontent.net/video.mp4",
+		StreamType: "mp4",
+		Title:      "Cached Test Video",
+		Headers:    map[string]string{"Referer": "https://streamtape.com/"},
+	}
+	h.cache.Set("st:mock-cached-id", fakeExt, 1*time.Hour)
+
+	req := httptest.NewRequest("GET", "/extract/st/mock-cached-id", nil)
+	w := httptest.NewRecorder()
+
+	start := time.Now()
+	h.ServeHTTP(w, req)
+	elapsed := time.Since(start)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	// Should be served in less than 5ms from cache
+	if elapsed > 10*time.Millisecond {
+		t.Errorf("cache hit took too long: %v", elapsed)
+	}
+
+	cc := resp.Header.Get("Cache-Control")
+	if !strings.Contains(cc, "max-age=3600") {
+		t.Errorf("expected Cache-Control with max-age=3600, got %s", cc)
+	}
+
+	var resData map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&resData)
+	if resData["title"] != "Cached Test Video" {
+		t.Errorf("expected title 'Cached Test Video', got %v", resData["title"])
+	}
+}
