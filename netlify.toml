@@ -1,0 +1,26 @@
+[build]
+  functions = "netlify/functions"
+
+[build.environment]
+  GO_VERSION = "1.22.0"
+
+# Direct all proxy traffic to the Go serverless function
+[[redirects]]
+  from = "/session/*"
+  to = "/.netlify/functions/proxy"
+  status = 200
+
+[[redirects]]
+  from = "/extract/*"
+  to = "/.netlify/functions/proxy"
+  status = 200
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/proxy"
+  status = 200
+
+[[redirects]]
+  from = "/health"
+  to = "/.netlify/functions/proxy"
+  status = 200
