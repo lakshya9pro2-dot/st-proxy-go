@@ -155,6 +155,12 @@ func (h *ProxyHandler) deriveBaseURL(r *http.Request) string {
 	}
 	host := r.Host
 	if host == "" {
+		host = r.Header.Get("X-Forwarded-Host")
+	}
+	if host == "" {
+		host = r.Header.Get("Host")
+	}
+	if host == "" {
 		host = "localhost:8888"
 	}
 	return fmt.Sprintf("%s://%s", scheme, host)

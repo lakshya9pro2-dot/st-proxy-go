@@ -102,6 +102,9 @@ func RunLambdaRuntime(handler http.Handler) {
 
 		for k, v := range event.Headers {
 			httpReq.Header.Set(k, v)
+			if strings.EqualFold(k, "host") && httpReq.Host == "" {
+				httpReq.Host = v
+			}
 		}
 		for k, values := range event.MultiValueHeaders {
 			for _, v := range values {
